@@ -1,7 +1,4 @@
-const fs = require("fs");
-const path = require("path");
-
-const DB_PATH = path.join(__dirname, "..", "data.json");
+const { Pool } = require("pg");
 
 const DEFAULT_RECURRING = [
   { id: "rent", name: "Аренда квартиры", amount: 650, day: 5 },
@@ -17,64 +14,83 @@ const DEFAULT_TEMPLATES = [
   { id: "t3", name: "Такси", cat: "transport", amount: 8 },
 ];
 
-function defaultUserData() {
+let pool;
+
+// Подключение создаётся один раз и переиспользуется (пул соединений),
+// а не открывается заново на каждый запрос.
+function getPool() {
+  if (!pool) {
+    const connectionString = process.env.DATABASE_URL;
+    if (!connectionString) {
+      throw new Error("DATABASE_URL не задана. Пропиши строку подключения Supabase в переменных окружения.");
+    }
+    pool = new Pool({
+      connectionString,
+      ssl: { rejectUnauthorized: false }, // Supabase требует SSL, но с самоподписанным цепочка не всегда проверяется чисто
+    });
+  }
+  return pool;
+}
+
+// Создаёт таблицу, если её ещё нет. Безопасно вызывать при каждом старте сервера —
+// IF NOT EXISTS не даст пересоздать существующую таблицу и стереть данные.
+async function initSchema() {
+  const db = getPool();
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS user_data (
+      chat_id TEXT PRIMARY KEY,
+      periods JSONB NOT NULL DEFAULT '{}'::jsonb,
+      recurring JSONB NOT NULL DEFAULT '[]'::jsonb,
+      templates JSONB NOT NULL DEFAULT '[]'::jsonb,
+      limits_data JSONB NOT NULL DEFAULT '{}'::jsonb,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `);
+}
+
+async function ensureUser(chatId) {
+  const db = getPool();
+  const existing = await db.query("SELECT chat_id FROM user_data WHERE chat_id = $1", [chatId]);
+  if (existing.rows.length === 0) {
+    await db.query(
+      `INSERT INTO user_data (chat_id, periods, recurring, templates, limits_data)
+       VALUES ($1, '{}'::jsonb, $2::jsonb, $3::jsonb, '{}'::jsonb)`,
+      [chatId, JSON.stringify(DEFAULT_RECURRING), JSON.stringify(DEFAULT_TEMPLATES)]
+    );
+  }
+}
+
+async function getUserData(chatId) {
+  await ensureUser(chatId);
+  const db = getPool();
+  const result = await db.query("SELECT * FROM user_data WHERE chat_id = $1", [chatId]);
+  const row = result.rows[0];
   return {
-    periods: {},
-    recurring: DEFAULT_RECURRING,
-    templates: DEFAULT_TEMPLATES,
-    limits: {},
+    periods: row.periods,
+    recurring: row.recurring,
+    templates: row.templates,
+    limits: row.limits_data,
   };
 }
 
-// Весь файл читается и пишется целиком — для одного-двух пользователей
-// и объёма данных (траты/цели за несколько месяцев) этого с большим запасом достаточно,
-// а простота важнее: нет риска поломки нативного модуля при деплое на Render.
-function readDb() {
-  if (!fs.existsSync(DB_PATH)) {
-    return {};
+async function saveField(chatId, field, value) {
+  await ensureUser(chatId);
+  const db = getPool();
+  const column = field === "limits" ? "limits_data" : field;
+  const allowedColumns = ["periods", "recurring", "templates", "limits_data"];
+  if (!allowedColumns.includes(column)) {
+    throw new Error(`Недопустимое поле: ${field}`);
   }
-  try {
-    const raw = fs.readFileSync(DB_PATH, "utf8");
-    return raw ? JSON.parse(raw) : {};
-  } catch (err) {
-    console.error("Ошибка чтения базы данных, использую пустую:", err.message);
-    return {};
-  }
+  await db.query(
+    `UPDATE user_data SET ${column} = $1::jsonb, updated_at = now() WHERE chat_id = $2`,
+    [JSON.stringify(value), chatId]
+  );
 }
 
-function writeDb(data) {
-  fs.writeFileSync(DB_PATH, JSON.stringify(data, null, 2), "utf8");
+async function getAllChatIds() {
+  const db = getPool();
+  const result = await db.query("SELECT chat_id FROM user_data");
+  return result.rows.map(r => r.chat_id);
 }
 
-function ensureUser(chatId) {
-  const all = readDb();
-  if (!all[chatId]) {
-    all[chatId] = defaultUserData();
-    writeDb(all);
-  }
-}
-
-function getUserData(chatId) {
-  const all = readDb();
-  if (!all[chatId]) {
-    all[chatId] = defaultUserData();
-    writeDb(all);
-  }
-  return all[chatId];
-}
-
-function saveField(chatId, field, value) {
-  const all = readDb();
-  if (!all[chatId]) {
-    all[chatId] = defaultUserData();
-  }
-  all[chatId][field] = value;
-  writeDb(all);
-}
-
-function getAllChatIds() {
-  const all = readDb();
-  return Object.keys(all);
-}
-
-module.exports = { getUserData, saveField, getAllChatIds, ensureUser };
+module.exports = { getUserData, saveField, getAllChatIds, ensureUser, initSchema };

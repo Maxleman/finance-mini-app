@@ -22,8 +22,8 @@ function createBot(token, webappUrl) {
 
   // Собирает текстовую сводку по текущему месяцу для конкретного chatId.
   // Используется и в команде /status, и в вечернем автонапоминании — одна логика, без дублирования.
-  function buildSummary(chatId) {
-    const data = db.getUserData(chatId);
+  async function buildSummary(chatId) {
+    const data = await db.getUserData(chatId);
     const period = data.periods[monthKeyNow()];
 
     if (!period) {
@@ -55,14 +55,19 @@ function createBot(token, webappUrl) {
     ].join("\n");
   }
 
-  bot.onText(/\/start/, (msg) => {
+  bot.onText(/\/start/, async (msg) => {
     const chatId = String(msg.chat.id);
-    db.ensureUser(chatId);
-    bot.sendMessage(
-      chatId,
-      "Привет! Это твой личный финансовый трекер.\n\nЖми кнопку ниже чтобы открыть приложение — там доход, обязательные платежи, цели и быстрая запись трат.\n\nКоманда /help покажет список всех команд.",
-      mainKeyboard()
-    );
+    try {
+      await db.ensureUser(chatId);
+      bot.sendMessage(
+        chatId,
+        "Привет! Это твой личный финансовый трекер.\n\nЖми кнопку ниже чтобы открыть приложение — там доход, обязательные платежи, цели и быстрая запись трат.\n\nКоманда /help покажет список всех команд.",
+        mainKeyboard()
+      );
+    } catch (err) {
+      console.error("Ошибка /start:", err.message);
+      bot.sendMessage(chatId, "Что-то пошло не так при подключении к базе данных. Попробуй ещё раз чуть позже.");
+    }
   });
 
   bot.onText(/\/app/, (msg) => {
@@ -70,9 +75,15 @@ function createBot(token, webappUrl) {
     bot.sendMessage(chatId, "Открываю трекер 👇", mainKeyboard());
   });
 
-  bot.onText(/\/status/, (msg) => {
+  bot.onText(/\/status/, async (msg) => {
     const chatId = String(msg.chat.id);
-    bot.sendMessage(chatId, buildSummary(chatId), mainKeyboard());
+    try {
+      const summary = await buildSummary(chatId);
+      bot.sendMessage(chatId, summary, mainKeyboard());
+    } catch (err) {
+      console.error("Ошибка /status:", err.message);
+      bot.sendMessage(chatId, "Не получилось получить данные. Попробуй ещё раз чуть позже.");
+    }
   });
 
   bot.onText(/\/help/, (msg) => {
@@ -96,37 +107,51 @@ function createBot(token, webappUrl) {
   // Расписание задаётся в часовом поясе Europe/Minsk, не в UTC сервера Render.
 
   // Каждый вечер в 21:00 — сводка по остатку + кнопка открыть приложение
-  cron.schedule("0 21 * * *", () => {
-    const chatIds = db.getAllChatIds();
-    chatIds.forEach(chatId => {
-      const summary = buildSummary(chatId);
-      bot.sendMessage(chatId, `🌙 Вечерняя сводка\n\n${summary}\n\nНе забыл записать траты за сегодня?`, mainKeyboard())
-        .catch(err => console.error(`Не удалось отправить вечернее уведомление ${chatId}:`, err.message));
-    });
+  cron.schedule("0 21 * * *", async () => {
+    try {
+      const chatIds = await db.getAllChatIds();
+      for (const chatId of chatIds) {
+        try {
+          const summary = await buildSummary(chatId);
+          await bot.sendMessage(chatId, `🌙 Вечерняя сводка\n\n${summary}\n\nНе забыл записать траты за сегодня?`, mainKeyboard());
+        } catch (err) {
+          console.error(`Не удалось отправить вечернее уведомление ${chatId}:`, err.message);
+        }
+      }
+    } catch (err) {
+      console.error("Ошибка вечерней рассылки:", err.message);
+    }
   }, { timezone: "Europe/Minsk" });
 
   // 1-го числа в 9:00 — напомнить указать доход и проверить обязательные платежи
-  cron.schedule("0 9 1 * *", () => {
-    const chatIds = db.getAllChatIds();
-    chatIds.forEach(chatId => {
-      const data = db.getUserData(chatId);
-      const activeRecurring = data.recurring.filter(r => !r.installment || r.monthsLeft > 0);
-      const recurringText = activeRecurring.length
-        ? activeRecurring.map(r => `• ${r.name} — ${r.amount} BYN`).join("\n")
-        : "нет обязательных платежей";
+  cron.schedule("0 9 1 * *", async () => {
+    try {
+      const chatIds = await db.getAllChatIds();
+      for (const chatId of chatIds) {
+        try {
+          const data = await db.getUserData(chatId);
+          const activeRecurring = data.recurring.filter(r => !r.installment || r.monthsLeft > 0);
+          const recurringText = activeRecurring.length
+            ? activeRecurring.map(r => `• ${r.name} — ${r.amount} BYN`).join("\n")
+            : "нет обязательных платежей";
 
-      const text = [
-        "📅 Новый месяц начался!",
-        "",
-        "Не забудь указать доход за этот месяц в трекере.",
-        "",
-        "Обязательные платежи на этот месяц:",
-        recurringText,
-      ].join("\n");
+          const text = [
+            "📅 Новый месяц начался!",
+            "",
+            "Не забудь указать доход за этот месяц в трекере.",
+            "",
+            "Обязательные платежи на этот месяц:",
+            recurringText,
+          ].join("\n");
 
-      bot.sendMessage(chatId, text, mainKeyboard())
-        .catch(err => console.error(`Не удалось отправить месячное уведомление ${chatId}:`, err.message));
-    });
+          await bot.sendMessage(chatId, text, mainKeyboard());
+        } catch (err) {
+          console.error(`Не удалось отправить месячное уведомление ${chatId}:`, err.message);
+        }
+      }
+    } catch (err) {
+      console.error("Ошибка месячной рассылки:", err.message);
+    }
   }, { timezone: "Europe/Minsk" });
 
   bot.on("polling_error", (err) => {
