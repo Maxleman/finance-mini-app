@@ -12,7 +12,8 @@
     "node-telegram-bot-api": "^0.66.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
-    "node-cron": "^3.0.3"
+    "node-cron": "^3.0.3",
+    "pg": "^8.13.0"
   },
   "engines": {
     "node": ">=18.0.0"
