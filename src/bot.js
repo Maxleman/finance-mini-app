@@ -15,32 +15,19 @@ function createBot(token, webappUrl) {
     };
   }
 
-  bot.onText(/\/start/, (msg) => {
-    const chatId = String(msg.chat.id);
-    db.ensureUser(chatId);
-    bot.sendMessage(
-      chatId,
-      "Привет! Это твой личный финансовый трекер.\n\nЖми кнопку ниже чтобы открыть приложение — там доход, обязательные платежи, цели и быстрая запись трат.",
-      mainKeyboard()
-    );
-  });
-
-  bot.onText(/\/app/, (msg) => {
-    const chatId = String(msg.chat.id);
-    bot.sendMessage(chatId, "Открываю трекер 👇", mainKeyboard());
-  });
-
-  // /status — быстрая сводка прямо в чате, без открытия Mini App
-  bot.onText(/\/status/, (msg) => {
-    const chatId = String(msg.chat.id);
-    const data = db.getUserData(chatId);
+  function monthKeyNow() {
     const now = new Date();
-    const monthKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
-    const period = data.periods[monthKey];
+    return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+  }
+
+  // Собирает текстовую сводку по текущему месяцу для конкретного chatId.
+  // Используется и в команде /status, и в вечернем автонапоминании — одна логика, без дублирования.
+  function buildSummary(chatId) {
+    const data = db.getUserData(chatId);
+    const period = data.periods[monthKeyNow()];
 
     if (!period) {
-      bot.sendMessage(chatId, "За этот месяц пока ничего не записано. Открой трекер чтобы начать.", mainKeyboard());
-      return;
+      return "За этот месяц пока ничего не записано. Открой трекер чтобы начать.";
     }
 
     const incomes = period.incomes || [];
@@ -56,7 +43,7 @@ function createBot(token, webappUrl) {
       ? goals.map(g => `${g.emoji || "🎯"} ${g.name}: ${g.saved}/${g.target} BYN`).join("\n")
       : "нет целей на этот месяц";
 
-    const text = [
+    return [
       `💰 Сводка за месяц`,
       ``,
       `Доход: ${totalIncome} BYN`,
@@ -66,26 +53,81 @@ function createBot(token, webappUrl) {
       `🎯 Цели:`,
       goalsText,
     ].join("\n");
+  }
 
-    bot.sendMessage(chatId, text, mainKeyboard());
+  bot.onText(/\/start/, (msg) => {
+    const chatId = String(msg.chat.id);
+    db.ensureUser(chatId);
+    bot.sendMessage(
+      chatId,
+      "Привет! Это твой личный финансовый трекер.\n\nЖми кнопку ниже чтобы открыть приложение — там доход, обязательные платежи, цели и быстрая запись трат.\n\nКоманда /help покажет список всех команд.",
+      mainKeyboard()
+    );
+  });
+
+  bot.onText(/\/app/, (msg) => {
+    const chatId = String(msg.chat.id);
+    bot.sendMessage(chatId, "Открываю трекер 👇", mainKeyboard());
+  });
+
+  bot.onText(/\/status/, (msg) => {
+    const chatId = String(msg.chat.id);
+    bot.sendMessage(chatId, buildSummary(chatId), mainKeyboard());
   });
 
   bot.onText(/\/help/, (msg) => {
     bot.sendMessage(
       String(msg.chat.id),
-      "Команды:\n/app — открыть трекер\n/status — быстрая сводка\n/remind — настроить напоминания"
+      [
+        "📋 Список команд:",
+        "",
+        "/app — открыть трекер",
+        "/status — краткая сводка за месяц",
+        "/help — этот список",
+        "",
+        "🔔 Автоматические уведомления:",
+        "Каждый вечер в 21:00 — сводка по остатку.",
+        "1-го числа месяца — напоминание указать доход и проверить обязательные платежи.",
+      ].join("\n")
     );
   });
 
-  // По твоему запросу — уведомления только когда сам попросишь, без автоматики по расписанию.
-  // Если захочешь автоматические — раскомментируй cron ниже и пропиши OWNER_CHAT_ID.
-  /*
+  // ── Автонапоминания ──────────────────────────────────────────
+  // Расписание задаётся в часовом поясе Europe/Minsk, не в UTC сервера Render.
+
+  // Каждый вечер в 21:00 — сводка по остатку + кнопка открыть приложение
   cron.schedule("0 21 * * *", () => {
-    const ownerChatId = process.env.OWNER_CHAT_ID;
-    if (!ownerChatId) return;
-    bot.sendMessage(ownerChatId, "Не забыл записать траты сегодня? 👀", mainKeyboard());
-  });
-  */
+    const chatIds = db.getAllChatIds();
+    chatIds.forEach(chatId => {
+      const summary = buildSummary(chatId);
+      bot.sendMessage(chatId, `🌙 Вечерняя сводка\n\n${summary}\n\nНе забыл записать траты за сегодня?`, mainKeyboard())
+        .catch(err => console.error(`Не удалось отправить вечернее уведомление ${chatId}:`, err.message));
+    });
+  }, { timezone: "Europe/Minsk" });
+
+  // 1-го числа в 9:00 — напомнить указать доход и проверить обязательные платежи
+  cron.schedule("0 9 1 * *", () => {
+    const chatIds = db.getAllChatIds();
+    chatIds.forEach(chatId => {
+      const data = db.getUserData(chatId);
+      const activeRecurring = data.recurring.filter(r => !r.installment || r.monthsLeft > 0);
+      const recurringText = activeRecurring.length
+        ? activeRecurring.map(r => `• ${r.name} — ${r.amount} BYN`).join("\n")
+        : "нет обязательных платежей";
+
+      const text = [
+        "📅 Новый месяц начался!",
+        "",
+        "Не забудь указать доход за этот месяц в трекере.",
+        "",
+        "Обязательные платежи на этот месяц:",
+        recurringText,
+      ].join("\n");
+
+      bot.sendMessage(chatId, text, mainKeyboard())
+        .catch(err => console.error(`Не удалось отправить месячное уведомление ${chatId}:`, err.message));
+    });
+  }, { timezone: "Europe/Minsk" });
 
   bot.on("polling_error", (err) => {
     console.error("Telegram polling error:", err.message);
